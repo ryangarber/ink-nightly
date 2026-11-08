@@ -1,0 +1,24 @@
+{
+	"name": "ink-nightly-release",
+	"private": true,
+	"type": "module",
+	"description": "Syncs vadimdemedes/ink@master nightly and publishes it as ink-nightly.",
+	"scripts": {
+		"typecheck": "tsc",
+		"dry-run": "rylease --dry-run"
+	},
+	"license": "MIT",
+	"devEngines": {
+		"runtime": {
+			"name": "node",
+			"version": ">=24 <27",
+			"onFail": "download"
+		}
+	},
+	"devDependencies": {
+		"@rylease/cli": "^0.1.1",
+		"@types/node": "^26.6.6",
+		"rylease": "^3.1.0",
+		"typescript": "7.1.0-beta"
+	}
+}

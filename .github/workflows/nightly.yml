@@ -1,0 +1,41 @@
+name: nightly
+
+on:
+  # Syncs vadimdemedes/ink@master and publishes a nightly when it changed.
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Report what would be released, without releasing it.
+        type: boolean
+        default: false
+  # Every push to main dry-runs the release, to check the config.
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  id-token: write # trusted publishing to npm, and provenance
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  nightly:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # full history is needed to find the previous nightly
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - uses: ryangarber/rylease@v3
+        with:
+          dry-run: ${{ github.event_name == 'push' || inputs.dry-run == true }}
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }} # not needed with trusted publishing
