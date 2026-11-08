@@ -1,0 +1,497 @@
+import stringWidth from 'string-width';
+import {
+	type StyledChar,
+	ansiCodesToString,
+	diffAnsiCodes,
+	styledCharsFromTokens,
+	tokenize,
+} from '@alcalzone/ansi-tokenize';
+import measureText from './measure-text.js';
+import {type OutputTransformer} from './render-node-to-output.js';
+import sanitizeAnsi from './sanitize-ansi.js';
+import SizedCache from './sized-cache.js';
+
+const isSameStyle = (
+	a: StyledChar['styles'],
+	b: StyledChar['styles'],
+): boolean =>
+	a === b ||
+	(a.length === b.length &&
+		a.every(
+			(code, index) =>
+				code.code === b[index]!.code && code.endCode === b[index]!.endCode,
+		));
+
+// Same output as `styledCharsToString` from ansi-tokenize, which diffs the styles of every pair of neighboring characters. Neighbors usually share styles, so skipping the diff for them avoids most of that work. Holes (undefined cells) are skipped.
+const styledCharsToString = (
+	characters: ReadonlyArray<StyledChar | undefined>,
+): string => {
+	let result = '';
+	let previous: StyledChar | undefined;
+
+	for (const character of characters) {
+		if (character === undefined) {
+			continue;
+		}
+
+		if (previous === undefined) {
+			result += ansiCodesToString(character.styles);
+		} else if (!isSameStyle(previous.styles, character.styles)) {
+			result += ansiCodesToString(
+				diffAnsiCodes(previous.styles, character.styles),
+			);
+		}
+
+		result += character.value;
+		previous = character;
+	}
+
+	if (previous !== undefined && previous.styles.length > 0) {
+		result += ansiCodesToString(diffAnsiCodes(previous.styles, []));
+	}
+
+	return result;
+};
+
+// Replaces a partially visible wide character with a space that keeps its styles.
+const blankCell = (cell: StyledChar): StyledChar => ({
+	...cell,
+	value: ' ',
+	fullWidth: false,
+});
+
+/**
+"Virtual" output class
+
+Handles the positioning and saving of the output of each node in the tree. Also responsible for applying transformations to each character of the output.
+
+Used to generate the final output of all nodes before writing it to actual output stream (e.g. stdout)
+*/
+
+type Options = {
+	width: number;
+	height: number;
+};
+
+type Operation = WriteOperation | ClipOperation | UnclipOperation;
+
+type WriteOperation = {
+	type: 'write';
+	x: number;
+	y: number;
+	text: string;
+	transformers: OutputTransformer[];
+};
+
+type ClipOperation = {
+	type: 'clip';
+	clip: Clip;
+};
+
+type Clip = {
+	x1: number | undefined;
+	x2: number | undefined;
+	y1: number | undefined;
+	y2: number | undefined;
+};
+
+type UnclipOperation = {
+	type: 'unclip';
+};
+
+// An undefined bound means "unbounded on this edge", so intersecting keeps whichever bound is defined and takes the tighter one when both are.
+const intersectBound = (
+	a: number | undefined,
+	b: number | undefined,
+	tighter: (a: number, b: number) => number,
+): number | undefined => {
+	if (a === undefined) {
+		return b;
+	}
+
+	return b === undefined ? a : tighter(a, b);
+};
+
+// Bounds are half-open: `x2`/`y2` are exclusive, so an axis is empty as soon as its lower bound reaches its upper one.
+const isClipEmpty = (clip: Clip): boolean =>
+	(clip.x1 !== undefined && clip.x2 !== undefined && clip.x1 >= clip.x2) ||
+	(clip.y1 !== undefined && clip.y2 !== undefined && clip.y1 >= clip.y2);
+
+const intersectClips = (outer: Clip | undefined, inner: Clip): Clip => {
+	if (!outer) {
+		return inner;
+	}
+
+	return {
+		x1: intersectBound(outer.x1, inner.x1, Math.max),
+		x2: intersectBound(outer.x2, inner.x2, Math.min),
+		y1: intersectBound(outer.y1, inner.y1, Math.max),
+		y2: intersectBound(outer.y2, inner.y2, Math.min),
+	};
+};
+
+// Count rows without tokenizing text that may be outside the viewport.
+const countLines = (text: string): number => {
+	let count = 1;
+	for (
+		let index = text.indexOf('\n');
+		index !== -1;
+		index = text.indexOf('\n', index + 1)
+	) {
+		count++;
+	}
+
+	return count;
+};
+
+// Prevent style chars from taking up a cell.
+const parseStyledChars = (text: string): StyledChar[] =>
+	styledCharsFromTokens(tokenize(text)).filter(
+		character => !/^\p{Default_Ignorable_Code_Point}+$/u.test(character.value),
+	);
+
+class OutputCaches {
+	// Sized by UTF-16 code units. Most entries are single characters, so real text stays under about 2 MB.
+	widths = new SizedCache<string, number>(2 ** 18);
+
+	// Sized by UTF-16 code units, but each unit is a styled character object of about 140 bytes, so this holds up to about 9 MB. Only single lines are kept, since whole blocks would multiply that. A smaller budget re-tokenizes noticeably more.
+	styledChars = new SizedCache<string, StyledChar[]>(2 ** 16);
+	sanitizedLines = new SizedCache<string, string>(2 ** 18);
+	lines = new SizedCache<string, string[]>(2 ** 20);
+
+	getLines(text: string): string[] {
+		let cached = this.lines.get(text);
+		if (cached === undefined) {
+			// Carry styles across newlines, but only keep the first.
+			const characters = text.includes('\n')
+				? parseStyledChars(text)
+				: this.getStyledChars(text);
+			const characterLines: StyledChar[][] = [[]];
+			for (const character of characters) {
+				if (character.value === '\n') {
+					characterLines.push([]);
+				} else {
+					characterLines.at(-1)!.push(character);
+				}
+			}
+
+			cached = characterLines.map(line => styledCharsToString(line));
+			// Include styles and hyperlinks reopened on each line.
+			this.lines.set(
+				text,
+				cached,
+				text.length + cached.reduce((size, line) => size + line.length, 0),
+			);
+		}
+
+		return cached;
+	}
+
+	getSanitizedLine(line: string): string {
+		let cached = this.sanitizedLines.get(line);
+		if (cached === undefined) {
+			cached = sanitizeAnsi(line);
+			this.sanitizedLines.set(line, cached, line.length);
+		}
+
+		return cached;
+	}
+
+	getStyledChars(line: string): StyledChar[] {
+		let cached = this.styledChars.get(line);
+		if (cached === undefined) {
+			cached = parseStyledChars(line);
+			if (!line.includes('\n')) {
+				this.styledChars.set(line, cached, line.length);
+			}
+		}
+
+		return cached;
+	}
+
+	getStringWidth(text: string): number {
+		let cached = this.widths.get(text);
+		if (cached === undefined) {
+			cached = stringWidth(text);
+			this.widths.set(text, cached, text.length);
+		}
+
+		return cached;
+	}
+
+	getWidestLine(text: string): number {
+		// Layout already measured most blocks, so share its cache instead of keeping another copy.
+		return measureText(text).width;
+	}
+}
+
+const emptyCell: StyledChar = {
+	type: 'char',
+	value: ' ',
+	fullWidth: false,
+	styles: [],
+};
+
+// Each frame creates an Output, but most of its text is unchanged. Keep these
+// text-only caches across frames and bound them to avoid retaining every write.
+const sharedCaches = new OutputCaches();
+
+export default class Output {
+	private readonly operations: Operation[] = [];
+	private readonly caches: OutputCaches = sharedCaches;
+
+	width: number;
+	height: number;
+
+	constructor(options: Options) {
+		const {width, height} = options;
+
+		this.width = width;
+		this.height = height;
+	}
+
+	private applyWriteOperation(
+		output: StyledChar[][],
+		operation: WriteOperation,
+		clip: Clip | undefined,
+	): void {
+		const {text, transformers} = operation;
+		let {x, y} = operation;
+		const lineCount = countLines(text);
+		if (
+			y + lineCount <= 0 ||
+			y >= output.length ||
+			(clip &&
+				(isClipEmpty(clip) ||
+					(typeof clip.y1 === 'number' &&
+						typeof clip.y2 === 'number' &&
+						(y + lineCount <= clip.y1 || y >= clip.y2))))
+		) {
+			return;
+		}
+
+		// Preserve styles across explicit newlines before clipping individual rows.
+		let lines = this.caches.getLines(text);
+
+		if (clip) {
+			const shouldClipHorizontally =
+				typeof clip?.x1 === 'number' && typeof clip?.x2 === 'number';
+
+			const shouldClipVertically =
+				typeof clip?.y1 === 'number' && typeof clip?.y2 === 'number';
+
+			// If text is positioned outside of clipping area altogether,
+			// skip to the next operation to avoid unnecessary calculations
+			if (shouldClipHorizontally) {
+				const width = this.caches.getWidestLine(text);
+
+				if (x + width < clip.x1! || x > clip.x2!) {
+					return;
+				}
+			}
+
+			if (shouldClipHorizontally) {
+				lines = lines.map(line => {
+					const from = x < clip.x1! ? clip.x1! - x : 0;
+					const width = this.caches.getStringWidth(line);
+					const to = x + width > clip.x2! ? clip.x2! - x : width;
+
+					return this.sliceLineToColumns(line, from, to);
+				});
+
+				if (x < clip.x1!) {
+					x = clip.x1!;
+				}
+			}
+
+			if (shouldClipVertically) {
+				const from = y < clip.y1! ? clip.y1! - y : 0;
+				const height = lines.length;
+				const to = y + height > clip.y2! ? clip.y2! - y : height;
+
+				lines = lines.slice(from, to);
+
+				if (y < clip.y1!) {
+					y = clip.y1!;
+				}
+			}
+		}
+
+		for (let [index, line] of lines.entries()) {
+			const currentLine = output[y + index];
+
+			// Lines above or below the output area have no corresponding pre-initialized row.
+			if (!currentLine) {
+				continue;
+			}
+
+			for (const transformer of transformers) {
+				line = transformer(line, index + y - operation.y);
+			}
+
+			// `squashTextNodes` sanitizes the output of child transforms, but this node's own transform runs here, after that.
+			if (transformers.length > 0) {
+				line = this.caches.getSanitizedLine(line);
+			}
+
+			const characters = this.caches.getStyledChars(line);
+
+			// Nothing to write (e.g. line was clipped away).
+			if (characters.length === 0) {
+				continue;
+			}
+
+			let offsetX = x;
+
+			// Wide characters (e.g. CJK) occupy two cells: a leading
+			// cell with the character and a trailing placeholder with
+			// value ''. When an overlapping write lands in the middle
+			// of a wide character, the boundary cells need cleanup so
+			// the terminal never renders a half-visible wide character.
+			// Preserve the styles of cells outside the overlapping write.
+			if (
+				currentLine[offsetX]?.value === '' &&
+				offsetX > 0 &&
+				this.caches.getStringWidth(currentLine[offsetX - 1]?.value ?? '') > 1
+			) {
+				currentLine[offsetX - 1] = blankCell(currentLine[offsetX - 1]!);
+			}
+
+			for (const character of characters) {
+				currentLine[offsetX] = character;
+
+				// Determine printed width using string-width to align with measurement
+				const characterWidth = Math.max(
+					1,
+					this.caches.getStringWidth(character.value),
+				);
+
+				// For multi-column characters, clear following cells to avoid stray spaces/artifacts
+				if (characterWidth > 1) {
+					for (let offset = 1; offset < characterWidth; offset++) {
+						currentLine[offsetX + offset] = {
+							type: 'char',
+							// Preserve visible cells when the leading cell is outside the output.
+							value: offsetX < 0 ? ' ' : '',
+							fullWidth: false,
+							styles: character.styles,
+						};
+					}
+				}
+
+				offsetX += characterWidth;
+			}
+
+			if (currentLine[offsetX]?.value === '') {
+				currentLine[offsetX] = blankCell(currentLine[offsetX]!);
+			}
+		}
+	}
+
+	write(
+		x: number,
+		y: number,
+		text: string,
+		options: {transformers: OutputTransformer[]},
+	): void {
+		const {transformers} = options;
+
+		if (text === '') {
+			return;
+		}
+
+		this.operations.push({
+			type: 'write',
+			x,
+			y,
+			text,
+			transformers,
+		});
+	}
+
+	clip(clip: Clip) {
+		this.operations.push({
+			type: 'clip',
+			clip,
+		});
+	}
+
+	unclip() {
+		this.operations.push({
+			type: 'unclip',
+		});
+	}
+
+	// Clipping works in terminal columns. A wide character (e.g. CJK) occupies two cells, so when a clip edge falls between its halves, the character must be replaced by a space that keeps its styles, otherwise its background disappears and the rest of the line shifts by a column.
+	sliceLineToColumns(line: string, from: number, to: number): string {
+		if (from >= to) {
+			return '';
+		}
+
+		const result: StyledChar[] = [];
+		let column = 0;
+
+		for (const character of this.caches.getStyledChars(line)) {
+			const width = this.caches.getStringWidth(character.value);
+			const start = column;
+			column += width;
+
+			if (column <= from) {
+				continue;
+			}
+
+			if (start >= to) {
+				break;
+			}
+
+			if (width > 1 && (start < from || column > to)) {
+				// Only part of this wide character is visible, so keep the cell count and styles, but drop the glyph itself.
+				result.push(blankCell(character));
+			} else {
+				result.push(character);
+			}
+		}
+
+		return styledCharsToString(result);
+	}
+
+	get(): {output: string; height: number} {
+		// Initialize output array with a specific set of rows, so that margin/padding at the bottom is preserved
+		const output: StyledChar[][] = [];
+
+		// Cells are replaced, never mutated, so every row can share one blank cell.
+		const blankRow: StyledChar[] = Array.from(
+			{length: this.width},
+			() => emptyCell,
+		);
+
+		for (let y = 0; y < this.height; y++) {
+			output.push([...blankRow]);
+		}
+
+		const clips: Clip[] = [];
+
+		for (const operation of this.operations) {
+			if (operation.type === 'clip') {
+				// Nested clips must intersect, not replace, otherwise an inner `overflow="hidden"` box lets content escape the outer clip and overwrite surrounding UI.
+				clips.push(intersectClips(clips.at(-1), operation.clip));
+			} else if (operation.type === 'unclip') {
+				clips.pop();
+			} else {
+				this.applyWriteOperation(output, operation, clips.at(-1));
+			}
+		}
+
+		const generatedOutput = output
+			.map(line =>
+				// Holes are skipped, see https://github.com/vadimdemedes/ink/pull/564#issuecomment-1637022742
+				styledCharsToString(line).trimEnd(),
+			)
+			.join('\n');
+
+		return {
+			output: generatedOutput,
+			height: output.length,
+		};
+	}
+}
