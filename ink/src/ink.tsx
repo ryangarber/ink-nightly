@@ -219,6 +219,8 @@ export default class Ink {
 		LogUpdate | DebouncedFunc<(output: string) => void>;
 
 	private readonly isScreenReaderEnabled: boolean;
+	// Created once so `rerender()` does not hand every `Box`, `Text` and `Transform` a new context value.
+	private readonly accessibilityContextValue: {isScreenReaderEnabled: boolean};
 	private readonly interactive: boolean;
 	private readonly renderThrottleMs: number;
 	private alternateScreen: boolean;
@@ -417,7 +419,14 @@ export default class Ink {
 		);
 
 		const renderTime = performance.now() - startTime;
-		this.renderFrame(output, outputHeight, staticOutput);
+		// `exit()` from an effect unmounts before `<Static>` has dropped the children it just rendered, so the final frame would write them a second time. Static changes that have not been rendered yet are still marked dirty.
+		const isStaticOutputAlreadyWritten =
+			this.isUnmounting && !this.rootNode.isStaticDirty;
+		this.renderFrame(
+			output,
+			outputHeight,
+			isStaticOutputAlreadyWritten ? '' : staticOutput,
+		);
 		this.options.onRender?.({renderTime});
 	};
 
@@ -431,6 +440,9 @@ export default class Ink {
 		this.isScreenReaderEnabled =
 			options.isScreenReaderEnabled ??
 			process.env['INK_SCREEN_READER'] === 'true';
+		this.accessibilityContextValue = {
+			isScreenReaderEnabled: this.isScreenReaderEnabled,
+		};
 
 		// CI detection takes precedence: even a TTY stdout in CI defaults to non-interactive.
 		// Using Boolean(isTTY) (rather than an 'in' guard) correctly handles piped streams
@@ -1035,10 +1047,13 @@ export default class Ink {
 	}
 
 	render(node: ReactNode): void {
+		// Mounting a tree into an unmounted instance would run effects (such as enabling raw mode) that `unmount()` can no longer clean up.
+		if (this.isUnmounted || this.isUnmounting) {
+			return;
+		}
+
 		const tree = (
-			<AccessibilityContext
-				value={{isScreenReaderEnabled: this.isScreenReaderEnabled}}
-			>
+			<AccessibilityContext value={this.accessibilityContextValue}>
 				<App
 					stdin={this.options.stdin}
 					stdout={this.options.stdout}
