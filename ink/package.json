@@ -1,6 +1,6 @@
 {
 	"name": "ink-nightly",
-	"version": "8.0.1-nightly.3",
+	"version": "8.0.1-nightly.4",
 	"description": "React for CLI (nightly builds of vadimdemedes/ink@master)",
 	"license": "MIT",
 	"repository": {
