@@ -1,4 +1,4 @@
-> **ink-nightly** is an unofficial nightly build of [ink](https://github.com/vadimdemedes/ink) at [`2a88584`](https://github.com/vadimdemedes/ink/commit/2a885845648d70564a8722bf06bd38802614740f) on `master`. Install it in ink's place with `npm install ink@npm:ink-nightly`.
+> **ink-nightly** is an unofficial nightly build of [ink](https://github.com/vadimdemedes/ink) at [`0c0ebc0`](https://github.com/vadimdemedes/ink/commit/0c0ebc048ccfc3d78dcdf1602df3fd3e31f8258f) on `master`. Install it in ink's place with `npm install ink@npm:ink-nightly`.
 
 [![](https://raw.githubusercontent.com/vshymanskyy/StandWithUkraine/main/banner2-direct.svg)](https://github.com/vshymanskyy/StandWithUkraine/blob/main/docs/README.md)
 
